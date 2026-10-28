@@ -93,12 +93,12 @@ def parseTrayLayout(path: str) -> List[List[str]]:
     Each line lists, from left to right as seen in the image, the label of each fruit position
     (cells can be separated by commas, semicolons or tabs, so a CSV saved from a spreadsheet works).
     Blank lines, empty cells and lines starting with '#' are ignored. For example, a tray with
-    rows of 5, 4, 5 and 4 fruit, numbered from the bottom-right corner, is written as:
+    rows of 4, 5, 4 and 5 fruit, numbered left to right starting at the top row, is written as:
 
-        18,17,16,15,14
-        13,12,11,10
-        9,8,7,6,5
-        4,3,2,1
+        1,2,3,4
+        5,6,7,8,9
+        10,11,12,13
+        14,15,16,17,18
 
     Labels made of digits are zero-padded so they sort and read well in file names (9 becomes 09).
     Other labels (such as A1) are used as written, with unusual characters replaced by '_'.
@@ -297,7 +297,7 @@ class FruitInstances:
     The fruit found on one tray image, in numbering order.
 
     This is created once per tray image and used for both the segmented fruit files and the
-    full masked image, so the two always agree on which fruit has which number.
+    clean full masked image, so the two always agree on which fruit has which number.
 
     Attributes:
         boxes: (N, 6) array of [x1, y1, x2, y2, confidence, class] for the kept fruit.
@@ -308,7 +308,7 @@ class FruitInstances:
             the fruit's position because a fruit is missing from its row), 'reference' (matched
             to the optional tray reference because the rows could not place it), or 'unplaced'
             (research mode could not tell which tray position the fruit is in).
-        rejected: (box, reason) for each detection discarded as a false detection.
+        rejected: (box, reason, mask) for each detection discarded as a false detection.
         report: Research-mode check of this tray image (counts, status, notes).
     """
 
@@ -316,7 +316,7 @@ class FruitInstances:
     masks: Any
     labels: List[str]
     placement: List[str]
-    rejected: List[Tuple[Any, str]] = field(default_factory=list)
+    rejected: List[Tuple[Any, str, Any]] = field(default_factory=list)
     report: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -341,8 +341,13 @@ class Segmentation(Analysis):
             a timestamped folder within "results/segmentation".
         tray_infos (ImageListValue): Directory path for saving tray information of analyzed images,
             defaults to a timestamped folder within "results/segmentation".
-        masked_images (ImageListValue): Directory path for saving full-masked images, defaults to
-            a timestamped folder within "results/segmentation".
+        masked_images (ImageListValue): Directory path for saving the unfiltered full-masked images
+            (everything the model found, no numbering), defaults to a timestamped folder within
+            "results/segmentation".
+        masked_images_clean (ImageListValue): Directory path for saving the clean full-masked images
+            (numbered, false detections removed).
+        seg_images_false_positive (ImageListValue): Directory path for saving the detections that
+            were discarded as false detections.
     """
 
     __analysis_name__ = "segmentation"
@@ -356,6 +361,7 @@ class Segmentation(Analysis):
         self.layout_rows: Optional[List[List[str]]] = None
         # filled in as each tray image is processed, and written out as csv files at the end
         self._manifest_rows: List[Dict[str, Any]] = []
+        self._false_positive_rows: List[Dict[str, Any]] = []
         self._report_rows: List[Dict[str, Any]] = []
 
         # selects a model from the list to be used in this analysis
@@ -509,7 +515,7 @@ class Segmentation(Analysis):
             + "0, 90, 180 or 270 turns every image by that many degrees clockwise instead, "
             + "which keeps the numbering the same when trays are photographed in different "
             + "orientations. Fruit numbers and tray layouts always refer to the image as "
-            + "shown in the full masked image.",
+            + "shown in the clean full masked image (full_masked_images_clean).",
         )
         self.orientation.setValidValues(["auto", "0", "90", "180", "270"])
         self.orientation.setValue("auto")
@@ -550,7 +556,7 @@ class Segmentation(Analysis):
             "Research mode only. The number of fruit expected on each tray, for example 18. "
             + "It must equal the number of positions in the tray layout file. Fewer fruit "
             + "than this is not an error (fruit may have been removed), but the tray image "
-            + "is flagged in the console, on the full masked image and in numbering_report.csv.",
+            + "is flagged in the console, on the clean full masked image and in numbering_report.csv.",
         )
         self.nexpect.setMin(0)
         self.nexpect.setValue(0)
@@ -561,9 +567,9 @@ class Segmentation(Analysis):
             "tray_layout",
             "Research mode only. Path to a text or CSV file that describes the tray: one line "
             + "per row of fruit, top row first, listing the label of each fruit position from "
-            + "left to right as the tray looks in the full masked image. For a tray with rows "
-            + "of 5, 4, 5 and 4 fruit numbered from the bottom-right corner the file contains "
-            + "the four lines 18,17,16,15,14 then 13,12,11,10 then 9,8,7,6,5 then 4,3,2,1.",
+            + "left to right as the tray looks in the clean full masked image. For a tray with rows "
+            + "of 4, 5, 4 and 5 fruit numbered left to right from the top row the file contains "
+            + "the four lines 1,2,3,4 then 5,6,7,8,9 then 10,11,12,13 then 14,15,16,17,18.",
         )
         self.tray_layout.setValue("")
         self.tray_layout.setIsRequired(False)
@@ -614,7 +620,8 @@ class Segmentation(Analysis):
         self.masked_images = ImageListValue(
             "f_img",
             "full_masked_image",
-            "The output directory where the full-masked images are written.",
+            "The output directory where the full-masked images are written. These show everything "
+            + "the model found on the tray (fruit and false detections alike), with no numbering.",
         )
         self.masked_images.setValue(
             os.path.join(
@@ -623,6 +630,35 @@ class Segmentation(Analysis):
                 self.__analysis_name__,
                 self.analysis_time,
                 "full_masked_images",
+            )
+        )
+        self.masked_images_clean = ImageListValue(
+            "f_img_clean",
+            "full_masked_image_clean",
+            "The output directory where the clean full-masked images are written: turned as "
+            + "specified, false detections removed, every fruit numbered as in its segmented file name.",
+        )
+        self.masked_images_clean.setValue(
+            os.path.join(
+                os.curdir,
+                "results",
+                self.__analysis_name__,
+                self.analysis_time,
+                "full_masked_images_clean",
+            )
+        )
+        self.seg_images_false_positive = ImageListValue(
+            "seg_fp",
+            "segmented_image_false_positive",
+            "The output directory where the detections discarded as false detections are written.",
+        )
+        self.seg_images_false_positive.setValue(
+            os.path.join(
+                os.curdir,
+                "results",
+                self.__analysis_name__,
+                self.analysis_time,
+                "segmented_images_false_positive",
             )
         )
 
@@ -941,7 +977,7 @@ class Segmentation(Analysis):
 
     def _rejectFalseDetections(
         self, data: NDArray[np.float32], indices: NDArray[np.int64]
-    ) -> Tuple[NDArray[np.int64], List[Tuple[Any, str]]]:
+    ) -> Tuple[NDArray[np.int64], List[Tuple[Any, str, int]]]:
         """
         Splits fruit detections into the ones to keep and the ones discarded as false detections.
 
@@ -956,9 +992,10 @@ class Segmentation(Analysis):
             indices: Positions in `data` of the fruit-class detections to check.
 
         Returns:
-            The positions in `data` to keep, and a (detection, reason) pair for each one discarded.
+            The positions in `data` to keep, and a (detection, reason, position in `data`) triple for
+            each one discarded.
         """
-        rejected: List[Tuple[Any, str]] = []
+        rejected: List[Tuple[Any, str, int]] = []
         if len(indices) < 3:
             return indices, rejected
 
@@ -978,7 +1015,7 @@ class Segmentation(Analysis):
                 reason = f"area is under {min_ratio:g} x the median fruit area"
             else:
                 reason = f"shape is {longer[j] / shorter[j]:.1f}:1, over the {max_aspect:g}:1 limit"
-            rejected.append((data[indices[j]], reason))
+            rejected.append((data[indices[j]], reason, int(indices[j])))
         return indices[~(too_small | too_long)], rejected
 
     @staticmethod
@@ -1283,7 +1320,7 @@ class Segmentation(Analysis):
         if len(fruit_idx) == 0:
             return None
         keep, rejected = self._rejectFalseDetections(data, fruit_idx)
-        for box, reason in rejected:
+        for box, reason, _ in rejected:
             print(
                 f"{tray_image.getImageName()}: discarded false detection at "
                 f"({int(box[0])}, {int(box[1])})-({int(box[2])}, {int(box[3])}), "
@@ -1309,7 +1346,7 @@ class Segmentation(Analysis):
             masks=mask_data[final],
             labels=labels,
             placement=placement,
-            rejected=rejected,
+            rejected=[(box, reason, mask_data[position]) for box, reason, position in rejected],
             report=report,
         )
 
@@ -1336,7 +1373,8 @@ class Segmentation(Analysis):
         This method applies segmentation masks to the input tray image and draws bounding boxes around the detected fruit.
         Each mask is colored uniquely. The fruit number is drawn large in the middle of each fruit and matches the
         NN in the segmented file name ``..._fruit_NN.png``. The confidence score is drawn at the top-left of the box.
-        Detections discarded as false detections are outlined in gray and marked "rejected". In research mode, a
+        Detections discarded as false detections are not drawn (they are on the unfiltered masked image, see
+        `_extractFullMaskedImage`, and saved as images, see `_extractFalsePositiveImages`). In research mode, a
         tray image that needs attention also gets a line of text along the bottom explaining why.
 
         Args:
@@ -1406,17 +1444,6 @@ class Segmentation(Analysis):
             color = (0, 0, 255) if instances.placement[i] == "unplaced" else (255, 255, 255)
             self._putOutlinedText(result, label, origin, num_scale, color, num_thick)
 
-        # detections that were discarded as false detections: gray, with no number
-        for box, _ in instances.rejected:
-            x1, y1, x2, y2 = (int(v) for v in box[:4])
-            cv2.rectangle(result, (x1, y1), (x2, y2), (128, 128, 128), max(1, self.bbox_thickness.getValue() // 2))
-            (rej_w, rej_h), _ = cv2.getTextSize("rejected", font, font_scale, text_thickness)
-            rej_origin = (
-                min(max(x1, 0) + 5, max(width - rej_w - 5, 0)),
-                min(max(y1, 0) + rej_h + 5, height - 5),
-            )
-            self._putOutlinedText(result, "rejected", rej_origin, font_scale, (200, 200, 200), text_thickness)
-
         # research mode: say why this tray image needs attention, shrunk to fit the image width
         banner = instances.report.get("banner", "")
         if banner:
@@ -1431,6 +1458,116 @@ class Segmentation(Analysis):
         )
         image_instance.setImage(result)
         return image_instance
+
+    def _extractFullMaskedImage(self, tray_image: Image) -> Optional[Image]:
+        """
+        Draws everything the model found on the tray image, before any filtering or numbering.
+
+        This is the picture Granny has always written to full_masked_images: every detection (fruit
+        or tray information, true or false) gets a colored mask, a bounding box and its confidence
+        score. There is deliberately no fruit number here; the numbered picture with the false
+        detections removed is the one in full_masked_images_clean. The image is turned the same way
+        as the clean one, so the two can be compared directly.
+
+        Args:
+            tray_image (Image): The tray image with segmentation results already set.
+
+        Returns:
+            The masked image, or None when the model found nothing on this tray image.
+        """
+        [results] = tray_image.getSegmentationResults()
+        if results.boxes is None or results.masks is None:
+            return None
+        data = results.boxes.cpu().numpy().data  # (N, 6): x1, y1, x2, y2, conf, cls
+        mask_data = results.masks.cpu().numpy().data  # (N, H, W)
+        num_instances = len(data)
+        if num_instances == 0:
+            return None
+
+        result = tray_image.getImage().copy()
+        alpha = self.mask_alpha.getValue()
+        brightness = self.color_brightness.getValue()
+        colors = [colorsys.hsv_to_rgb(i / num_instances, 1, brightness) for i in range(num_instances)]
+        random.shuffle(colors)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = self.font_scale.getValue()
+        text_thickness = self.text_thickness.getValue()
+        for i in range(num_instances):
+            mask = mask_data[i]
+            (r, g, b) = colors[i]
+            for c in range(3):
+                result[:, :, c] = np.where(
+                    mask == 1,
+                    result[:, :, c] * (1 - alpha) + alpha * colors[i][c] * 255,
+                    result[:, :, c],
+                )
+            x1, y1, x2, y2, conf, _ = data[i]
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            cv2.rectangle(result, (x1, y1), (x2, y2), (r * 255, g * 255, b * 255), self.bbox_thickness.getValue())
+            conf_text = "{:.3f}".format(conf)
+            (_, conf_h), _ = cv2.getTextSize(conf_text, font, font_scale, text_thickness)
+            cv2.putText(
+                result,
+                conf_text,
+                (max(x1, 0), max(y1, conf_h + 5)),
+                fontFace=font,
+                fontScale=font_scale,
+                color=(255, 255, 255),
+                thickness=text_thickness,
+            )
+
+        image_instance: Image = RGBImage(pathlib.Path(tray_image.getImageName()).stem + "_masked_image" + ".png")
+        image_instance.setImage(result)
+        return image_instance
+
+    def _extractFalsePositiveImages(self, tray_image: Image, instances: FruitInstances) -> List[Image]:
+        """
+        Cuts out each detection that was discarded as a false detection, so a person can always go
+        back and check whether the filter was right.
+
+        The images are made exactly like the fruit images (the detection's mask applied to its
+        bounding box) and are named ``<image>_false_positive_NN.png``, numbered 01, 02, ... in
+        order of position on the tray image (top to bottom, then left to right). What was discarded,
+        and why, is also recorded in false_positives.csv.
+
+        Args:
+            tray_image (Image): The tray image the detections came from.
+            instances (FruitInstances): The result of `_getFruitInstances` for that image.
+
+        Returns:
+            One image per discarded detection (an empty list when nothing was discarded).
+        """
+        tray_array: NDArray[np.uint8] = tray_image.getImage()
+        height, width = tray_array.shape[:2]
+        stem = pathlib.Path(tray_image.getImageName()).stem
+        discarded = sorted(instances.rejected, key=lambda item: (item[0][1], item[0][0]))
+
+        images: List[Image] = []
+        for number, (box, reason, mask) in enumerate(discarded, start=1):
+            x1, y1, x2, y2 = (int(v) for v in box[:4])
+            x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, width), min(y2, height)
+            file_name = f"{stem}_false_positive_{number:02d}.png"
+            self._false_positive_rows.append(
+                {
+                    "image": tray_image.getImageName(),
+                    "file": file_name,
+                    "reason": reason,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "confidence": round(float(box[4]), 3),
+                }
+            )
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = np.zeros([y2 - y1, x2 - x1, 3], dtype=np.uint8)
+            for channel in range(3):
+                crop[:, :, channel] = tray_array[y1:y2, x1:x2, channel] * mask[y1:y2, x1:x2]  # type: ignore
+            image_instance: Image = RGBImage(file_name)
+            image_instance.setImage(crop)
+            images.append(image_instance)
+        return images
 
     def _sortInstances(self, boxes: NDArray[np.float32], img_shape: Tuple[int, int]):
         """
@@ -1596,6 +1733,7 @@ class Segmentation(Analysis):
         # checks the options (and reads the tray layout in research mode) before doing any work
         self._checkOptions()
         self._manifest_rows = []
+        self._false_positive_rows = []
         self._report_rows = []
         self._orientation_info = {}
         self._reference_samples = []
@@ -1665,7 +1803,14 @@ class Segmentation(Analysis):
             self._orientation_info[image_instance.getImageName()] = (turned, orientation_note, certain)
 
             try:
-                # finds, filters and numbers the fruit once, for the fruit images and the masked image
+                # the unfiltered picture of everything the model found goes to "full_masked_images"
+                # first, so it is there even when no fruit is found
+                full_masked_image = self._extractFullMaskedImage(image_instance)
+                if full_masked_image is not None:
+                    self.masked_images.setImageList([full_masked_image])
+                    self.masked_images.writeValue()
+
+                # finds, filters and numbers the fruit once, for the fruit images and the clean masked image
                 instances = self._getFruitInstances(image_instance)
                 if instances is None:
                     print(f"{image_instance.getImageName()}: no fruit found")
@@ -1676,21 +1821,28 @@ class Segmentation(Analysis):
                 image_instances = self._extractImage(image_instance, instances)
                 # and tray information
                 tray_infos = self._extractTrayInfo(image_instance)
-                # and masked image
-                masked_image = self._extractMaskedImage(image_instance, instances)
+                # and the clean masked image (numbered, false detections removed)
+                clean_masked_image = self._extractMaskedImage(image_instance, instances)
+                # and the detections that were discarded as false detections
+                false_positive_images = self._extractFalsePositiveImages(image_instance, instances)
 
                 # 1. sets the output ImageListValue with the list of segmented images
                 # 2. writes the segmented images to "segmented_images" folder
-                # 3. writes the tray information to "tray_info" folder
-                # 4. writes the full masked images to "full_masked_images" folder
+                # 3. writes the tray information to "tray_infos" folder
+                # 4. writes the clean masked image to "full_masked_images_clean" folder
+                # 5. writes the discarded detections to "segmented_images_false_positive" folder
                 self.seg_images.setImageList(image_instances)
                 self.seg_images.writeValue()
 
                 self.tray_infos.setImageList(tray_infos)
                 self.tray_infos.writeValue()
 
-                self.masked_images.setImageList([masked_image])
-                self.masked_images.writeValue()
+                self.masked_images_clean.setImageList([clean_masked_image])
+                self.masked_images_clean.writeValue()
+
+                if false_positive_images:
+                    self.seg_images_false_positive.setImageList(false_positive_images)
+                    self.seg_images_false_positive.writeValue()
 
                 self._recordResults(image_instance, instances)
             except Exception as err:
@@ -1771,7 +1923,8 @@ class Segmentation(Analysis):
 
     def _writeReports(self) -> None:
         """
-        Writes fruit_manifest.csv (every fruit file with its label and position on the image) and, in
+        Writes fruit_manifest.csv (every fruit file with its label and position on the image),
+        false_positives.csv (every discarded detection with the reason) and, in
         research mode, numbering_report.csv (one line per tray image with the count check), next to
         the segmented_images folder.
         """
@@ -1779,6 +1932,9 @@ class Segmentation(Analysis):
         if self._manifest_rows:
             os.makedirs(out_dir, exist_ok=True)
             pd.DataFrame(self._manifest_rows).to_csv(os.path.join(out_dir, "fruit_manifest.csv"), index=False)
+        if self._false_positive_rows:
+            os.makedirs(out_dir, exist_ok=True)
+            pd.DataFrame(self._false_positive_rows).to_csv(os.path.join(out_dir, "false_positives.csv"), index=False)
         if self.layout_rows is not None and self._report_rows:
             os.makedirs(out_dir, exist_ok=True)
             pd.DataFrame(self._report_rows).to_csv(os.path.join(out_dir, "numbering_report.csv"), index=False)
