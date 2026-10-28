@@ -77,7 +77,7 @@ class Analysis(ABC):
             "cpu",
             "cpu",
             "Number of CPU cores to use for parallel processing. "
-            "Set to 0 for automatic (uses 80% of available cores). "
+            "Set to 0 for automatic (uses 80 percent of available cores). "
             "Default is 0 (automatic)."
         )
         self.cpu.setMin(0)

@@ -14,11 +14,15 @@ author: Nhan H. Nguyen
 """
 
 import colorsys
+import itertools
 import os
 import pathlib
 import random
+import re
+import sys
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib import request
 
 import cv2
@@ -35,6 +39,7 @@ from Granny.Models.Values.FileNameValue import FileNameValue
 from Granny.Models.Values.FloatValue import FloatValue
 from Granny.Models.Values.ImageListValue import ImageListValue
 from Granny.Models.Values.IntValue import IntValue
+from Granny.Models.Values.StringValue import StringValue
 from numpy.typing import NDArray
 
 
@@ -80,6 +85,241 @@ class SegmentationConfig:
     }
 
 
+def parseTrayLayout(path: str) -> List[List[str]]:
+    """
+    Reads a tray layout file used by research mode.
+
+    The file looks like the tray does in the image: one line per row of fruit, top row first.
+    Each line lists, from left to right as seen in the image, the label of each fruit position
+    (cells can be separated by commas, semicolons or tabs, so a CSV saved from a spreadsheet works).
+    Blank lines, empty cells and lines starting with '#' are ignored. For example, a tray with
+    rows of 5, 4, 5 and 4 fruit, numbered from the bottom-right corner, is written as:
+
+        18,17,16,15,14
+        13,12,11,10
+        9,8,7,6,5
+        4,3,2,1
+
+    Labels made of digits are zero-padded so they sort and read well in file names (9 becomes 09).
+    Other labels (such as A1) are used as written, with unusual characters replaced by '_'.
+
+    Args:
+        path (str): Path of the layout file.
+
+    Returns:
+        List[List[str]]: The file-name-ready labels, one list per row, top row first.
+
+    Raises:
+        ValueError: If the file can't be read, has no labels, or uses a label more than once.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as layout_file:
+            lines = layout_file.read().splitlines()
+    except OSError as err:
+        raise ValueError(f"cannot read the tray layout file '{path}' ({err.strerror or err})")
+
+    raw_rows: List[List[str]] = []
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        cells = [cell.strip() for cell in re.split(r"[,;\t]", line)]
+        cells = [cell for cell in cells if cell]
+        if cells:
+            raw_rows.append(cells)
+    if not raw_rows:
+        raise ValueError(f"the tray layout file '{path}' does not contain any labels")
+
+    digit_widths = [len(c) for row in raw_rows for c in row if re.fullmatch(r"[0-9]+", c)]
+    width = max([2] + digit_widths)
+
+    rows: List[List[str]] = []
+    seen: Dict[str, str] = {}
+    for row in raw_rows:
+        labels = []
+        for cell in row:
+            if re.fullmatch(r"[0-9]+", cell):
+                label = str(int(cell)).zfill(width)
+            else:
+                label = re.sub(r"[^A-Za-z0-9_-]", "_", cell)
+            if label in seen:
+                raise ValueError(
+                    f"the tray layout file '{path}' uses the label '{cell}' more than once "
+                    f"(also as '{seen[label]}'); every position needs its own label"
+                )
+            seen[label] = cell
+            labels.append(label)
+        rows.append(labels)
+    return rows
+
+
+def parseTrayReference(path: str, layout_rows: List[List[str]]) -> Dict[str, Tuple[float, float]]:
+    """
+    Reads a tray reference file: where each tray position sits in the picture when the tray is
+    the right way up, as a fraction of the image width (x) and height (y).
+
+    Granny writes this file itself (tray_reference.csv, in the results folder) after a research
+    run on photos of trays that were numbered without doubt. It has the columns label, x, y (and
+    n_images, which is ignored). A reference may lack some positions; those positions simply
+    can't be used to place a fruit.
+
+    Raises:
+        ValueError: with a plain-language message when the file can't be used.
+    """
+    try:
+        table = pd.read_csv(path, dtype={"label": str}, comment="#")
+    except Exception as err:
+        raise ValueError(f"could not read the tray reference file '{path}': {err}")
+    if not {"label", "x", "y"} <= set(table.columns):
+        raise ValueError(
+            f"the tray reference file '{path}' must have the columns label, x and y. Use the "
+            + "tray_reference.csv that Granny writes in the results folder after a research run."
+        )
+    known = {label for row in layout_rows for label in row}
+    spots: Dict[str, Tuple[float, float]] = {}
+    for _, row in table.iterrows():
+        label = str(row["label"]).strip()
+        if label not in known:
+            raise ValueError(
+                f"the tray reference lists the position '{label}', which is not in the tray layout "
+                + "file. The reference and the layout must describe the same tray."
+            )
+        try:
+            x, y = float(row["x"]), float(row["y"])
+        except (TypeError, ValueError):
+            raise ValueError(f"the tray reference has a position ('{label}') without numbers for x and y.")
+        if label in spots:
+            raise ValueError(f"the tray reference lists the position '{label}' twice.")
+        spots[label] = (x, y)
+    if len(spots) < 3:
+        raise ValueError("the tray reference needs at least 3 positions to be useful.")
+    return spots
+
+
+def buildTrayReference(
+    samples: List[Dict[str, Tuple[float, float]]]
+) -> Dict[str, Tuple[float, float, int]]:
+    """
+    Combines tray images into one reference: the position of each label, as the median over the
+    images. Each image is first shifted to line up with the first one (by the median shift of the
+    labels they share), so photos taken with the camera or tray moved a little don't blur it.
+
+    Args:
+        samples: One dict per tray image, label -> (x, y) as fractions of the image size.
+
+    Returns:
+        label -> (x, y, number of images that contributed).
+    """
+    if not samples:
+        return {}
+    first = samples[0]
+    aligned: List[Dict[str, Tuple[float, float]]] = []
+    for sample in samples:
+        common = [label for label in sample if label in first]
+        if len(common) < 3:
+            continue
+        shift = np.median([[sample[l][0] - first[l][0], sample[l][1] - first[l][1]] for l in common], axis=0)
+        aligned.append({l: (x - shift[0], y - shift[1]) for l, (x, y) in sample.items()})
+    combined: Dict[str, Tuple[float, float, int]] = {}
+    for label in {l for sample in aligned for l in sample}:
+        points = np.array([sample[label] for sample in aligned if label in sample])
+        combined[label] = (float(np.median(points[:, 0])), float(np.median(points[:, 1])), len(points))
+    return combined
+
+
+def findColorCard(image: NDArray[np.uint8]) -> Optional[Tuple[float, float]]:
+    """
+    Looks for a ColorChecker-style color card (a block of 24 same-sized square patches, 6 x 4)
+    and returns the (x, y) pixel position of its center, or None when there is none.
+
+    The card is recognized by its patches rather than by its colors: small, square, similar-sized
+    outlines are collected, and a group of at least 14 of them that fills about a 6 x 4 block of
+    patches is taken to be the card. Labels, notes, tray pockets and fruit do not form such a
+    group. Works whichever way up the card is, and needs only OpenCV's standard functions.
+
+    Args:
+        image: The image to search (any channel order).
+
+    Returns:
+        The center of the card in the pixel coordinates of `image`, or None if no card was found.
+    """
+    h, w = image.shape[:2]
+    scale = min(1.0, 1600.0 / max(h, w))
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else image
+    long_side = max(small.shape[:2])
+    gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    edges = cv2.dilate(cv2.Canny(gray, 20, 60), np.ones((2, 2), np.uint8))
+    outlines, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    squares: List[Tuple[float, float, float]] = []  # (x, y, side)
+    for outline in outlines:
+        area = cv2.contourArea(outline)
+        if area < 0.5 * (0.008 * long_side) ** 2 or area > (0.05 * long_side) ** 2:
+            continue
+        (cx, cy), (rw, rh), _ = cv2.minAreaRect(outline)
+        if min(rw, rh) < 1 or max(rw, rh) / min(rw, rh) > 1.35 or area / (rw * rh) < 0.8:
+            continue
+        squares.append((cx, cy, (rw + rh) / 2))
+    if len(squares) < 14:
+        return None
+
+    # a patch gives both an outer and an inner outline: keep one of each pair
+    patches: List[Tuple[float, float, float]] = []
+    for sq in squares:
+        if all(np.hypot(sq[0] - o[0], sq[1] - o[1]) > 0.5 * min(sq[2], o[2]) for o in patches):
+            patches.append(sq)
+    pts = np.array(patches)
+
+    best: Optional[Tuple[int, NDArray[np.float64]]] = None
+    for x0, y0, side in pts:
+        group = pts[(np.abs(pts[:, 2] - side) < 0.3 * side) & (np.hypot(pts[:, 0] - x0, pts[:, 1] - y0) < 7.0 * side)]
+        if not 14 <= len(group) <= 40:
+            continue
+        center = group[:, :2].mean(0)
+        _, _, axes = np.linalg.svd(group[:, :2] - center, full_matrices=False)
+        proj = (group[:, :2] - center) @ axes.T
+        extent = proj.max(0) - proj.min(0)
+        pitch = side * 1.25
+        long_ext, short_ext = float(extent.max()), float(max(extent.min(), 1.0))
+        if not (3.0 <= long_ext / pitch + 1 <= 7.5 and 2.0 <= short_ext / pitch + 1 <= 5.0):
+            continue
+        if not 1.1 <= long_ext / short_ext <= 2.4:
+            continue
+        if best is None or len(group) > best[0]:
+            best = (len(group), center)
+    if best is None:
+        return None
+    return float(best[1][0] / scale), float(best[1][1] / scale)
+
+
+@dataclass
+class FruitInstances:
+    """
+    The fruit found on one tray image, in numbering order.
+
+    This is created once per tray image and used for both the segmented fruit files and the
+    full masked image, so the two always agree on which fruit has which number.
+
+    Attributes:
+        boxes: (N, 6) array of [x1, y1, x2, y2, confidence, class] for the kept fruit.
+        masks: (N, H, W) array with one binary mask per kept fruit.
+        labels: The number (or tray-layout label) of each kept fruit, as used in the file name.
+        placement: How each label was decided: 'sequential' (counted in tray order),
+            'layout' (matched to the tray layout), 'inferred' (matched to the tray layout from
+            the fruit's position because a fruit is missing from its row), 'reference' (matched
+            to the optional tray reference because the rows could not place it), or 'unplaced'
+            (research mode could not tell which tray position the fruit is in).
+        rejected: (box, reason) for each detection discarded as a false detection.
+        report: Research-mode check of this tray image (counts, status, notes).
+    """
+
+    boxes: Any
+    masks: Any
+    labels: List[str]
+    placement: List[str]
+    rejected: List[Tuple[Any, str]] = field(default_factory=list)
+    report: Dict[str, Any] = field(default_factory=dict)
+
+
 class Segmentation(Analysis):
     """
     Segmentation class for analyzing and segmenting images to identify fruit.
@@ -111,6 +351,12 @@ class Segmentation(Analysis):
         super().__init__()
         self.config = SegmentationConfig
         self.analysis_time = datetime.now().strftime("%Y-%m-%d-%H-%M")
+
+        # set from the tray layout file when running in research mode (see _checkOptions)
+        self.layout_rows: Optional[List[List[str]]] = None
+        # filled in as each tray image is processed, and written out as csv files at the end
+        self._manifest_rows: List[Dict[str, Any]] = []
+        self._report_rows: List[Dict[str, Any]] = []
 
         # selects a model from the list to be used in this analysis
         self.models = self.config.MODELS
@@ -224,6 +470,119 @@ class Segmentation(Analysis):
         self.row_tolerance.setValue(20)
         self.row_tolerance.setIsRequired(False)
 
+        # False-detection filter parameter
+        self.min_area_ratio = FloatValue(
+            "min_area_ratio",
+            "min_area_ratio",
+            "Fruit detections whose bounding-box area is smaller than this fraction of the "
+            + "median fruit detection area on the same tray image are discarded as false "
+            + "detections (e.g. a sliver of tray rim at the edge of the image). "
+            + "Range is 0.0 to 1.0. Set to 0 to disable the filter. Default is 0.3.",
+        )
+        self.min_area_ratio.setMin(0.0)
+        self.min_area_ratio.setMax(1.0)
+        self.min_area_ratio.setValue(0.3)
+        self.min_area_ratio.setIsRequired(False)
+
+        self.max_aspect_ratio = FloatValue(
+            "max_aspect_ratio",
+            "max_aspect_ratio",
+            "Fruit detections whose bounding box is longer than this many times its shorter "
+            + "side are discarded as false detections (e.g. a long strip of tray or "
+            + "background). A round fruit is close to 1, and elongated fruit such as pears "
+            + "are usually below 2. Set to 0 to disable the filter. Default is 3.0.",
+        )
+        self.max_aspect_ratio.setMin(0.0)
+        self.max_aspect_ratio.setMax(100.0)
+        self.max_aspect_ratio.setValue(3.0)
+        self.max_aspect_ratio.setIsRequired(False)
+
+        # Image orientation parameter
+        self.orientation = StringValue(
+            "orientation",
+            "orientation",
+            "How each image is turned before fruit are found and numbered. 'auto' (default) "
+            + "turns portrait images 90 degrees clockwise so every image is landscape; in "
+            + "research mode it then also tries turning each image 0, 90, 180 and 270 degrees "
+            + "and keeps the turn that fits the tray layout, so photos taken in different "
+            + "orientations are labeled the same way. "
+            + "0, 90, 180 or 270 turns every image by that many degrees clockwise instead, "
+            + "which keeps the numbering the same when trays are photographed in different "
+            + "orientations. Fruit numbers and tray layouts always refer to the image as "
+            + "shown in the full masked image.",
+        )
+        self.orientation.setValidValues(["auto", "0", "90", "180", "270"])
+        self.orientation.setValue("auto")
+        self.orientation.setIsRequired(False)
+
+        # Where the color card should end up (only used by research mode, see _chooseRotation)
+        self.card_position = StringValue(
+            "card_position",
+            "card_position",
+            "Research mode only. Some trays look the same upside down, so the tray layout alone "
+            + "cannot tell which way up the photo should be. For those trays Granny looks for a "
+            + "color card (ColorChecker) in the photo and turns the image so the card is on this "
+            + "side of the tray: top-right (default), top-left, bottom-right or bottom-left. If "
+            + "no color card is found the image is not turned and a note is added to the report.",
+        )
+        self.card_position.setValidValues(["top-right", "top-left", "bottom-right", "bottom-left"])
+        self.card_position.setValue("top-right")
+        self.card_position.setIsRequired(False)
+
+        # Research mode parameters
+        self.mode = StringValue(
+            "mode",
+            "mode",
+            "'standard' (default) numbers the fruit in each image 1, 2, 3 and so on in the "
+            + "order Granny finds them (top row first, right to left), for any number of "
+            + "fruit. 'research' gives each fruit the label of its position on a tray you "
+            + "describe with --tray_layout, checks the number of fruit found against "
+            + "--nexpect, and reports any tray image that needs attention. Research mode "
+            + "requires --nexpect and --tray_layout.",
+        )
+        self.mode.setValidValues(["standard", "research"])
+        self.mode.setValue("standard")
+        self.mode.setIsRequired(False)
+
+        self.nexpect = IntValue(
+            "nexpect",
+            "nexpect",
+            "Research mode only. The number of fruit expected on each tray, for example 18. "
+            + "It must equal the number of positions in the tray layout file. Fewer fruit "
+            + "than this is not an error (fruit may have been removed), but the tray image "
+            + "is flagged in the console, on the full masked image and in numbering_report.csv.",
+        )
+        self.nexpect.setMin(0)
+        self.nexpect.setValue(0)
+        self.nexpect.setIsRequired(False)
+
+        self.tray_layout = FileNameValue(
+            "tray_layout",
+            "tray_layout",
+            "Research mode only. Path to a text or CSV file that describes the tray: one line "
+            + "per row of fruit, top row first, listing the label of each fruit position from "
+            + "left to right as the tray looks in the full masked image. For a tray with rows "
+            + "of 5, 4, 5 and 4 fruit numbered from the bottom-right corner the file contains "
+            + "the four lines 18,17,16,15,14 then 13,12,11,10 then 9,8,7,6,5 then 4,3,2,1.",
+        )
+        self.tray_layout.setValue("")
+        self.tray_layout.setIsRequired(False)
+
+        self.tray_reference = FileNameValue(
+            "tray_reference",
+            "tray_reference",
+            "Research mode only, optional. Path to a tray_reference.csv that Granny wrote in the "
+            + "results folder after a run on photos of full trays. It records where each tray "
+            + "position sits in the picture, so fruit can still be given the right label when "
+            + "many fruit are missing and no row of the tray is complete. It works when the camera "
+            + "and tray are in about the same place in every photo: it is only used when the tray has "
+            + "moved by less than a third of the distance between neighboring positions, and a "
+            + "photo whose tray sits noticeably off the reference is reported for checking. "
+            + "A fruit that does not clearly sit on a recorded position is never labeled from it.",
+        )
+        self.tray_reference.setValue("")
+        self.tray_reference.setIsRequired(False)
+
         self.seg_images = ImageListValue(
             "seg_img",
             "segmented_images",
@@ -278,6 +637,14 @@ class Segmentation(Analysis):
             self.font_scale,
             self.text_thickness,
             self.row_tolerance,
+            self.min_area_ratio,
+            self.max_aspect_ratio,
+            self.orientation,
+            self.card_position,
+            self.mode,
+            self.nexpect,
+            self.tray_layout,
+            self.tray_reference,
         )
 
     def _getModelUrl(self, model_name: str):
@@ -335,42 +702,669 @@ class Segmentation(Analysis):
 
         return results
 
-    def _extractMaskedImage(self, tray_image: Image) -> Image:
+    def _checkOptions(self) -> None:
+        """
+        Checks the options the user gave, before any image is processed.
+
+        In research mode this also reads the tray layout file. Problems are reported as a plain
+        error message (without a traceback) so a mistyped option is easy to spot.
+        """
+
+        def fail(message: str) -> None:
+            sys.exit(f"error: {message}")
+
+        # Values that fail validation are stored as None, so a mistyped choice shows up here.
+        mode = self.mode.getValue()
+        if mode not in ("standard", "research"):
+            fail("--mode must be 'standard' or 'research'.")
+        if self.orientation.getValue() not in ("auto", "0", "90", "180", "270"):
+            fail("--orientation must be one of: auto, 0, 90, 180, 270.")
+        if self.card_position.getValue() not in ("top-right", "top-left", "bottom-right", "bottom-left"):
+            fail("--card_position must be one of: top-right, top-left, bottom-right, bottom-left.")
+
+        self.layout_rows = None
+        self.reference_spots = None
+        if mode != "research":
+            if self.tray_reference.getValue():
+                fail("--tray_reference is only used in research mode (add --mode research).")
+            return
+
+        nexpect = self.nexpect.getValue()
+        if not isinstance(nexpect, int) or nexpect < 1:
+            fail(
+                "research mode needs --nexpect, the number of fruit you expect on each tray "
+                + "(for example --nexpect 18)."
+            )
+        layout_path = self.tray_layout.getValue()
+        if not layout_path:
+            fail(
+                "research mode needs --tray_layout, the path to a file that describes the "
+                + "tray (run with --help to see how to write one)."
+            )
+        try:
+            rows = parseTrayLayout(layout_path)
+        except ValueError as err:
+            fail(str(err))
+        spots = sum(len(row) for row in rows)
+        if spots != nexpect:
+            fail(
+                f"--nexpect is {nexpect} but the tray layout file lists {spots} fruit "
+                + "positions. The two must match."
+            )
+        self.layout_rows = rows
+
+        reference_path = self.tray_reference.getValue()
+        if reference_path:
+            try:
+                self.reference_spots = parseTrayReference(reference_path, rows)
+            except ValueError as err:
+                fail(str(err))
+
+    def _orientImage(self, image_instance: Image) -> int:
+        """
+        Turns an image as requested by the orientation option.
+
+        'auto' keeps Granny's original behavior (portrait images are turned 90 degrees clockwise
+        so they are landscape); in research mode the tray layout is then used to pick the final
+        turn (see `_chooseRotation`). Otherwise every image is turned by the given number of
+        degrees clockwise, so trays photographed in different orientations are numbered the same
+        way.
+
+        Returns:
+            The number of degrees clockwise the image was turned.
+        """
+        setting = self.orientation.getValue()
+        if setting == "auto":
+            h, w, _ = image_instance.getShape()
+            if h > w:
+                image_instance.rotateImage()
+                return 90
+            return 0
+        code = {
+            "90": cv2.ROTATE_90_CLOCKWISE,
+            "180": cv2.ROTATE_180,
+            "270": cv2.ROTATE_90_COUNTERCLOCKWISE,
+        }.get(setting)
+        if code is not None:
+            image_instance.setImage(cv2.rotate(image_instance.getImage(), code))
+        return int(setting)
+
+    @staticmethod
+    def _rotateBoxes(
+        data: NDArray[np.float32], height: int, width: int, turn: int
+    ) -> Tuple[NDArray[np.float32], Tuple[int, int]]:
+        """
+        Where the boxes of an image of the given size would be if the image were turned.
+
+        Args:
+            data: (N, 6) array of [x1, y1, x2, y2, confidence, class].
+            height, width: Size of the image the boxes belong to.
+            turn: Degrees clockwise (0, 90, 180 or 270).
+
+        Returns:
+            The turned boxes, and the (height, width) of the turned image.
+        """
+        x1, y1, x2, y2 = (data[:, i].astype(np.float64) for i in range(4))
+        if turn == 90:
+            nx1, nx2, ny1, ny2, shape = height - y2, height - y1, x1, x2, (width, height)
+        elif turn == 180:
+            nx1, nx2, ny1, ny2, shape = width - x2, width - x1, height - y2, height - y1, (height, width)
+        elif turn == 270:
+            nx1, nx2, ny1, ny2, shape = y1, y2, width - x2, width - x1, (width, height)
+        else:
+            return data, (height, width)
+        turned = data.copy()
+        turned[:, 0], turned[:, 1], turned[:, 2], turned[:, 3] = nx1, ny1, nx2, ny2
+        return turned, shape
+
+    @staticmethod
+    def _turnPoint(x: float, y: float, height: int, width: int, turn: int) -> Tuple[float, float]:
+        """Where pixel (x, y) of a height x width image lands when the image is turned `turn` degrees clockwise."""
+        if turn == 90:
+            return height - y, x
+        if turn == 180:
+            return width - x, height - y
+        if turn == 270:
+            return y, width - x
+        return x, y
+
+    def _chooseRotation(self, image_instance: Image) -> Tuple[int, str, bool]:
+        """
+        Research mode: works out which way up a tray image should be, using the tray layout.
+
+        Each of the four turns (0, 90, 180, 270 degrees clockwise) is tried on the fruit already
+        found: the fruit are grouped into rows and matched to the layout exactly as they will be
+        for the real numbering, and the turn that lets the most fruit be placed wins. A wrong turn
+        gives rows of the wrong sizes, so most fruit stay unplaced; a stray detection or a missing
+        fruit only affects a few fruit and doesn't change the winner. The fruit are only found once
+        (the caller finds them again only if the image needs turning).
+
+        Some trays look the same upside down (the rows of the layout read the same backwards, like
+        a 5 x 5 tray). The fruit cannot say which way up such a photo is, so the position of the
+        color card decides: the image is turned so the card sits on the side of the tray given by
+        --card_position. If there is no color card, or its position is not clear, the image is
+        not turned at all and the note says so, because any choice would be a guess.
+
+        Args:
+            image_instance: The image with its segmentation results set, not yet turned.
+
+        Returns:
+            The turn to apply (degrees clockwise), a note for the report ("" when there is
+            nothing to say), and whether the orientation is certain.
+        """
+        fruit_cls = SegmentationConfig.CLASSES["fruits"]
+        [results] = image_instance.getSegmentationResults()
+        if results.boxes is None or results.masks is None:
+            return 0, "", True
+        boxes = results.boxes.cpu().numpy()
+        data = boxes.data
+        fruit_idx = np.where(boxes.cls == fruit_cls)[0]
+        if len(fruit_idx) == 0:
+            return 0, "", True
+        keep, _ = self._rejectFalseDetections(data, fruit_idx)
+        if len(keep) < 2:
+            return 0, "", True
+        height, width = boxes.orig_shape
+
+        def score_turns(use_reference: bool, limits: Tuple[float, float] = (0.3, 0.3)) -> Dict[int, Tuple[int, int]]:
+            result: Dict[int, Tuple[int, int]] = {}
+            for turn in (0, 90, 180, 270):
+                turned, shape = self._rotateBoxes(data[keep], height, width, turn)
+                df = self._sortInstances(turned, shape)
+                _, _, placement, _ = self._assignLayoutLabels(df, shape, use_reference, limits)
+                result[turn] = (
+                    sum(1 for p in placement if p != "unplaced"),
+                    placement.count("layout"),
+                )
+            return result
+
+        # the rows of the layout decide first; the tray reference (if any) is only consulted when
+        # the rows cannot place a single fruit in any turn, and then it must win clearly, because
+        # a tray with many fruit missing can look alike in two turns
+        scores = score_turns(False)
+        best = max(scores.values())
+        if best[0] == 0 and self.reference_spots:
+            # a tray staggered like this looks nearly the same turned 180 degrees and moved half a
+            # position, so here the tray may only have moved very little and the fruit must sit
+            # close to their positions (a fixed camera)
+            scores = score_turns(True, (0.15, 0.2))
+            ranked = sorted(scores.values(), reverse=True)
+            best = ranked[0]
+            if best[0] >= 3 and best[0] - ranked[1][0] < max(2, 0.25 * best[0]):
+                return 0, "the tray reference fits more than one turn about equally well; image not turned", False
+            if best[0] >= 3:
+                winner = [turn for turn, score in scores.items() if score == best][0]
+                return winner, "turned using the tray reference (the rows of the layout could not decide)", True
+            return 0, "no turn of the image fits the tray layout or the tray reference", False
+        if best[0] == 0:
+            return 0, "no turn of the image fits the tray layout", False
+        winners = [turn for turn, score in scores.items() if score == best]
+
+        # a layout whose rows read the same from the other end fits equally well turned 180 degrees
+        sizes = [len(row) for row in (self.layout_rows or [])]
+        symmetric = sizes == sizes[::-1]
+        candidates = sorted({w for w in winners} | ({(w + 180) % 360 for w in winners} if symmetric else set()))
+        if len(candidates) == 1:
+            return candidates[0], "", True
+
+        # the tray looks the same in several turns: only the color card can say which is right
+        names = ", ".join(str(t) for t in candidates)
+        position = self.card_position.getValue()
+        card = findColorCard(image_instance.getImage())
+        if card is None:
+            return 0, (
+                f"the tray fits the layout equally well turned {names} degrees and no color card "
+                + "was found to tell them apart; image not turned"
+            ), False
+
+        centers = np.column_stack([(data[keep, 0] + data[keep, 2]) / 2, (data[keep, 1] + data[keep, 3]) / 2])
+        fruit_center = centers.mean(axis=0)
+        wanted = np.array([1.0 if "right" in position else -1.0, -1.0 if position.startswith("top") else 1.0])
+        wanted /= np.linalg.norm(wanted)
+        fits = {}
+        for turn in candidates:
+            cx, cy = self._turnPoint(card[0], card[1], height, width, turn)
+            fx, fy = self._turnPoint(fruit_center[0], fruit_center[1], height, width, turn)
+            direction = np.array([cx - fx, cy - fy])
+            fits[turn] = float(direction @ wanted / max(np.linalg.norm(direction), 1e-9))
+        ranked = sorted(fits.items(), key=lambda item: -item[1])
+        (top_turn, top_fit), (_, second_fit) = ranked[0], ranked[1]
+        if top_fit < 0.4 or top_fit - second_fit < 0.5:
+            return 0, (
+                f"the tray fits the layout equally well turned {names} degrees and the color card "
+                + f"is not clearly on the {position} side of the tray; image not turned"
+            ), False
+        return top_turn, (
+            f"the tray fits the layout equally well turned {names} degrees; turned {top_turn} "
+            + f"degrees so the color card is on the {position} side"
+        ), True
+
+    def _rejectFalseDetections(
+        self, data: NDArray[np.float32], indices: NDArray[np.int64]
+    ) -> Tuple[NDArray[np.int64], List[Tuple[Any, str]]]:
+        """
+        Splits fruit detections into the ones to keep and the ones discarded as false detections.
+
+        A detection is discarded when its bounding box is unusually small compared with the other
+        fruit on the tray (area under min_area_ratio times the median area), or far too elongated
+        to be a fruit (longer than max_aspect_ratio times its shorter side). A sliver of tray rim
+        at the image edge or a long strip of background are typical examples. With fewer than three
+        fruit there is nothing to compare against, so nothing is discarded.
+
+        Args:
+            data: (N, 6) array of [x1, y1, x2, y2, confidence, class] for all detections.
+            indices: Positions in `data` of the fruit-class detections to check.
+
+        Returns:
+            The positions in `data` to keep, and a (detection, reason) pair for each one discarded.
+        """
+        rejected: List[Tuple[Any, str]] = []
+        if len(indices) < 3:
+            return indices, rejected
+
+        min_ratio = self.min_area_ratio.getValue()
+        max_aspect = self.max_aspect_ratio.getValue()
+        widths = data[indices, 2] - data[indices, 0]
+        heights = data[indices, 3] - data[indices, 1]
+        areas = widths * heights
+        longer = np.maximum(widths, heights)
+        shorter = np.maximum(np.minimum(widths, heights), 1)
+        none = np.zeros(len(indices), dtype=bool)
+        too_small = (areas < min_ratio * np.median(areas)) if min_ratio > 0 else none
+        too_long = (longer / shorter > max_aspect) if max_aspect > 0 else none
+
+        for j in np.where(too_small | too_long)[0]:
+            if too_small[j]:
+                reason = f"area is under {min_ratio:g} x the median fruit area"
+            else:
+                reason = f"shape is {longer[j] / shorter[j]:.1f}:1, over the {max_aspect:g}:1 limit"
+            rejected.append((data[indices[j]], reason))
+        return indices[~(too_small | too_long)], rejected
+
+    @staticmethod
+    def _snapToSlots(xs: NDArray[np.float64], references: List[NDArray[np.float64]]) -> Optional[List[int]]:
+        """
+        Works out which positions in a row hold the fruit when the row has fewer fruit than spots.
+
+        The x positions of the row's spots are taken from the complete rows of the same size on
+        the same image (each one is tried separately, because in a staggered tray the rows sit at
+        slightly different x positions). Every way of putting the fruit, in order, into the spots
+        is tried against every one of those rows, and the one where the fruit sit closest to the
+        spots wins.
+
+        Args:
+            xs: x-centers of the fruit found in the row, left to right.
+            references: x-centers of all the spots in each complete row of that size, left to
+                right (one array per complete row).
+
+        Returns:
+            The index of the spot each fruit sits in, or None when the answer is not clear (the
+            fruit don't sit on the spots, or two different placements fit about equally well).
+        """
+        found = len(xs)
+        spots = len(references[0])
+        if spots < 2:
+            return None
+        pitch = float(np.mean([np.median(np.diff(ref)) for ref in references]))
+        if pitch <= 0:
+            return None
+        cost_of: Dict[Tuple[int, ...], float] = {}
+        for ref in references:
+            for combo in itertools.combinations(range(spots), found):
+                cost = float(np.abs(xs - ref[list(combo)]).sum())
+                cost_of[combo] = min(cost, cost_of.get(combo, cost))
+        costs = sorted((cost, combo) for combo, cost in cost_of.items())
+        best_cost, best = costs[0]
+        if best_cost / found > 0.35 * pitch:
+            return None
+        if len(costs) > 1 and costs[1][0] - best_cost < 0.5 * pitch:
+            return None
+        return list(best)
+
+    def _placeByReference(
+        self,
+        df: pd.DataFrame,
+        shape: Tuple[int, int],
+        placed: List[Tuple[int, str, str]],
+        unplaced: List[int],
+        max_shift_factor: float = 0.3,
+        tol_factor: float = 0.3,
+    ) -> Tuple[int, float]:
+        """
+        Gives labels to fruit the rows could not place, using the tray reference (optional).
+
+        The reference says where each tray position sits in the picture. The whole tray may have
+        moved a little between photos, so first the shift that makes most fruit sit on a reference
+        position is found (at least 70 percent of the fruit, and at least 5, must agree, or nothing is
+        done; the shift may be at most `max_shift_factor` of the distance between neighboring
+        positions). Then each unplaced fruit takes the label of the reference position it sits on, but
+        only when it sits clearly closer to that position than to any other (within 0.3 of the
+        distance between neighboring positions), the position is not already taken, and no other
+        fruit claims it. Everything else stays unplaced.
+
+        Args:
+            df: The fruit of the image as returned by `_sortInstances`.
+            shape: (height, width) of the image, in pixels.
+            placed: Fruit already placed, as (fruit, label, how); extended in place.
+            unplaced: Fruit not yet placed; fruit that get a label are removed in place.
+            max_shift_factor: The most the tray may have moved, as a fraction of the distance
+                between neighboring reference positions.
+            tol_factor: How close a fruit must sit to a reference position (after the shift), as
+                a fraction of the same distance.
+
+        Returns:
+            The number of fruit placed with the reference, and how far the tray was found to sit
+            from the reference (as a fraction of the distance between neighboring positions).
+        """
+        spots = self.reference_spots
+        if not spots or not unplaced:
+            return 0, 0.0
+        height, width = shape
+        labels = list(spots)
+        ref = np.array([[spots[l][0] * width, spots[l][1] * height] for l in labels])
+        spacing = np.linalg.norm(ref[:, None] - ref[None], axis=2)
+        np.fill_diagonal(spacing, np.inf)
+        pitch = float(np.median(spacing.min(axis=1)))
+        tol = tol_factor * pitch
+
+        centers = df[["xcenter", "ycenter"]].to_numpy(dtype=float)
+        index_of = {int(n): i for i, n in enumerate(df["nums"])}
+
+        def nearest(shift: NDArray[np.float64]) -> Tuple[NDArray[np.float64], NDArray[np.int64]]:
+            dist = np.linalg.norm((centers - shift)[:, None] - ref[None], axis=2)
+            return dist.min(axis=1), dist.argmin(axis=1)
+
+        # The shift of the tray: the one that puts the most fruit on reference positions. It may be
+        # at most half the distance between neighboring positions: a tray with many fruit missing
+        # can look just like a different part of the tray after a larger shift, so a larger shift
+        # could not be told apart from a wrong match.
+        max_shift = max_shift_factor * pitch
+        best_shift, best_score = None, (0, 0.0)
+        for shift in np.vstack([np.zeros((1, 2)), (centers[:, None, :] - ref[None, :, :]).reshape(-1, 2)]):
+            if np.hypot(shift[0], shift[1]) > max_shift:
+                continue
+            near, _ = nearest(shift)
+            inside = near <= tol
+            score = (int(inside.sum()), -float(near[inside].sum()))
+            if best_shift is None or score > best_score:
+                best_shift, best_score = shift, score
+        if best_shift is None:
+            return 0, 0.0
+        near, which = nearest(best_shift)
+        inside = near <= tol
+        if inside.sum() < max(5, int(np.ceil(0.7 * len(centers)))):
+            return 0, 0.0
+        best_shift = best_shift + np.median((centers - ref[which])[inside] - best_shift, axis=0)
+
+        taken = {label for _, label, _ in placed}
+        free = [k for k, label in enumerate(labels) if label not in taken]
+        if not free:
+            return 0, 0.0
+        claims: Dict[str, List[int]] = {}
+        for fruit in unplaced:
+            point = centers[index_of[fruit]] - best_shift
+            dist = np.linalg.norm(ref[free] - point, axis=1)
+            order = np.argsort(dist)
+            if dist[order[0]] > tol:
+                continue
+            if len(order) > 1 and dist[order[1]] < 1.6 * dist[order[0]]:
+                continue
+            claims.setdefault(labels[free[order[0]]], []).append(fruit)
+        count = 0
+        for label, fruits in claims.items():
+            if len(fruits) == 1:
+                placed.append((fruits[0], label, "reference"))
+                unplaced.remove(fruits[0])
+                count += 1
+        return count, float(np.hypot(best_shift[0], best_shift[1]) / pitch)
+
+    def _assignLayoutLabels(
+        self,
+        df: pd.DataFrame,
+        shape: Tuple[int, int],
+        use_reference: bool = True,
+        reference_limits: Tuple[float, float] = (0.3, 0.3),
+    ) -> Tuple[List[int], List[str], List[str], Dict[str, Any]]:
+        """
+        Research mode: gives each fruit the label of its position in the tray layout file.
+
+        The fruit are grouped into the rows of the image (top row first) and ordered left to right
+        within each row. When the rows match the layout, each fruit takes the label at the same spot
+        of the layout. When a row has fewer fruit than spots (fruit removed from the tray), the
+        fruit are matched to spots by where they sit, using the spot positions of a complete row
+        of the same size on the same image. Fruit that can't be placed with confidence (the number
+        of rows differs, a row has too many fruit, or the answer is not clear) are labeled U01, U02
+        and so on, so they can never be mistaken for a position.
+
+        If a tray reference was given, fruit the rows could not place are then tried against it
+        (see `_placeByReference`).
+
+        Args:
+            df: The fruit of one tray image as returned by `_sortInstances`.
+            shape: (height, width) of the image, in pixels.
+            use_reference: Set to False to leave the tray reference out (used when choosing the
+                orientation, where the rows of the layout must have the first say).
+            reference_limits: (largest shift, largest distance of a fruit from a position) that
+                the tray reference may be trusted with (see `_placeByReference`).
+
+        Returns:
+            The fruit indices in label order, their labels, how each label was decided, and a
+            report with the counts, a status ('ok', 'fewer', 'more' or 'check') and notes.
+        """
+        layout = self.layout_rows or []
+        nexpect = int(self.nexpect.getValue())
+        detected = len(df)
+        rows_found = [
+            df[df["rows"] == r].sort_values("xcenter").reset_index(drop=True)
+            for r in range(1, int(df["rows"].max()) + 1)
+        ]
+
+        placed: List[Tuple[int, str, str]] = []
+        unplaced: List[int] = []
+        missing: List[str] = []
+
+        if len(rows_found) != len(layout):
+            for row in rows_found:
+                unplaced.extend(int(n) for n in row["nums"])
+        else:
+            # x positions of the spots in the rows that have all their fruit, by row size
+            reference: Dict[int, List[Any]] = {}
+            for row, spots in zip(rows_found, layout):
+                if len(row) == len(spots):
+                    reference.setdefault(len(spots), []).append(row["xcenter"].to_numpy(dtype=float))
+
+            for row, spots in zip(rows_found, layout):
+                slots: Optional[List[int]] = None
+                how = "layout"
+                if len(row) == len(spots):
+                    slots = list(range(len(row)))
+                elif len(row) < len(spots) and len(spots) in reference:
+                    slots = self._snapToSlots(row["xcenter"].to_numpy(dtype=float), reference[len(spots)])
+                    how = "inferred"
+                if slots is None:
+                    unplaced.extend(int(n) for n in row["nums"])
+                    continue
+                for fruit, slot in zip(row["nums"], slots):
+                    placed.append((int(fruit), spots[slot], how))
+                missing.extend(spots[s] for s in range(len(spots)) if s not in slots)
+
+        from_reference, reference_shift = (
+            self._placeByReference(df, shape, placed, unplaced, *reference_limits) if use_reference else (0, 0.0)
+        )
+        if from_reference and not unplaced:
+            # every fruit has a place now, so the empty positions are the labels nobody took
+            used = {label for _, label, _ in placed}
+            missing = [label for row in layout for label in row if label not in used]
+
+        order = [fruit for fruit, _, _ in placed]
+        labels = [label for _, label, _ in placed]
+        placement = [how for _, _, how in placed]
+        taken = {label for row in layout for label in row}
+        for count, fruit in enumerate(unplaced, start=1):
+            label = f"U{count:02d}"
+            while label in taken:
+                label += "x"
+            order.append(fruit)
+            labels.append(label)
+            placement.append("unplaced")
+
+        # the reference is trusted less when the tray sits far from where it has it
+        far_from_reference = from_reference > 0 and reference_shift > 0.15
+        if detected > nexpect:
+            status = "more"
+        elif unplaced or far_from_reference:
+            status = "check"
+        elif detected < nexpect:
+            status = "fewer"
+        else:
+            status = "ok"
+
+        notes: List[str] = []
+        if detected != nexpect:
+            notes.append(f"found {detected} fruit, expected {nexpect}")
+        if len(rows_found) != len(layout):
+            notes.append(f"found {len(rows_found)} rows of fruit, the layout has {len(layout)}")
+        if missing:
+            notes.append("empty positions: " + ", ".join(sorted(missing)))
+        if "inferred" in placement:
+            notes.append("some positions were worked out from where the fruit sit")
+        if from_reference:
+            notes.append(f"{from_reference} fruit were placed using the tray reference")
+        if far_from_reference:
+            notes.append(
+                f"the tray sits {reference_shift:.2f} position spacings from where the tray reference "
+                + "has it, so check the labels that came from the reference"
+            )
+        if unplaced:
+            notes.append(f"{len(unplaced)} fruit could not be matched to a tray position (labeled U01, U02, ...)")
+
+        report = {
+            "detected": detected,
+            "expected": nexpect,
+            "status": status,
+            "missing": sorted(missing),
+            "unplaced": len(unplaced),
+            "notes": "; ".join(notes),
+            "banner": "" if status == "ok" else "CHECK: " + "; ".join(notes),
+        }
+        return order, labels, placement, report
+
+    def _getFruitInstances(self, tray_image: Image) -> Optional[FruitInstances]:
+        """
+        Returns the fruit found on a tray image, with their numbers, in numbering order.
+
+        This is the single source of truth for fruit numbering. The segmented fruit files
+        (``..._fruit_NN.png``) and the full masked image both use what this returns, so the number
+        drawn on the masked image is always the NN in the matching file name.
+
+        Steps:
+            1. keeps only detections of the "fruits" class,
+            2. discards false detections (see `_rejectFalseDetections`),
+            3. sorts the remaining fruit in tray order (see `_sortInstances`),
+            4. numbers them 01, 02, ... in that order (standard mode), or gives each the label of
+               its position in the tray layout file and checks the count (research mode).
+
+        Args:
+            tray_image (Image): The tray image with segmentation results already set.
+
+        Returns:
+            The kept fruit, or None if no fruit was kept.
+        """
+        fruit_cls = SegmentationConfig.CLASSES["fruits"]
+        [results] = tray_image.getSegmentationResults()
+        if results.boxes is None or results.masks is None:
+            return None
+        boxes = results.boxes.cpu().numpy()
+        masks = results.masks.cpu().numpy()
+        data = boxes.data  # (N, 6): x1, y1, x2, y2, conf, cls
+        mask_data = masks.data  # (N, H, W)
+
+        fruit_idx = np.where(boxes.cls == fruit_cls)[0]
+        if len(fruit_idx) == 0:
+            return None
+        keep, rejected = self._rejectFalseDetections(data, fruit_idx)
+        for box, reason in rejected:
+            print(
+                f"{tray_image.getImageName()}: discarded false detection at "
+                f"({int(box[0])}, {int(box[1])})-({int(box[2])}, {int(box[3])}), "
+                f"confidence {box[4]:.3f}: {reason}"
+            )
+        if len(keep) == 0:
+            return None
+
+        # sorts the kept fruit based on xy-coordinates
+        sorted_df = self._sortInstances(data[keep], boxes.orig_shape)
+
+        report: Dict[str, Any] = {}
+        if self.layout_rows is None:
+            order = [int(n) for n in sorted_df["nums"]]
+            labels = [f"{i + 1:02d}" for i in range(len(order))]
+            placement = ["sequential"] * len(order)
+        else:
+            order, labels, placement, report = self._assignLayoutLabels(sorted_df, boxes.orig_shape)
+
+        final = keep[np.array(order, dtype=int)]
+        return FruitInstances(
+            boxes=data[final],
+            masks=mask_data[final],
+            labels=labels,
+            placement=placement,
+            rejected=rejected,
+            report=report,
+        )
+
+    @staticmethod
+    def _putOutlinedText(
+        image: NDArray[np.uint8],
+        text: str,
+        origin: Tuple[int, int],
+        scale: float,
+        color: Tuple[int, int, int],
+        thickness: int,
+    ) -> None:
+        """
+        Draws text with a dark outline so it can be read on any color.
+        """
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(image, text, origin, font, scale, (0, 0, 0), thickness + 8)
+        cv2.putText(image, text, origin, font, scale, color, thickness)
+
+    def _extractMaskedImage(self, tray_image: Image, instances: Optional[FruitInstances] = None) -> Image:
         """
         Extracts a masked image from the given tray image, overlaying segmentation masks and bounding boxes.
 
-        This method applies segmentation masks to the input tray image and draws bounding boxes around the detected objects.
-        Each mask is colored uniquely, and the confidence score of each detected object is displayed on the image.
+        This method applies segmentation masks to the input tray image and draws bounding boxes around the detected fruit.
+        Each mask is colored uniquely. The fruit number is drawn large in the middle of each fruit and matches the
+        NN in the segmented file name ``..._fruit_NN.png``. The confidence score is drawn at the top-left of the box.
+        Detections discarded as false detections are outlined in gray and marked "rejected". In research mode, a
+        tray image that needs attention also gets a line of text along the bottom explaining why.
 
         Args:
             tray_image (Image): The input tray image from which to extract the masked image.
                 This object is expected to have methods `getSegmentationResults()` and `getImage()`.
+            instances (FruitInstances): The fruit to draw. Found with `_getFruitInstances` when not given.
 
         Returns:
             Image: An image instance with the segmentation masks and bounding boxes overlaid.
         """
-        [result] = tray_image.getSegmentationResults()
-        masks = result.masks.cpu().numpy()
-        boxes = result.boxes.cpu().numpy()
-        confs = result.boxes.cpu().conf.numpy()
+        if instances is None:
+            instances = self._getFruitInstances(tray_image)
+        if instances is None:
+            raise AttributeError("No fruit found to draw on the masked image.")
 
-        # sorts boxes and masks based on xy-coordinates
-        sorted_df = self._sortInstances(boxes.data, boxes.orig_shape)
-        order: NDArray[np.float32] = sorted_df["nums"].to_numpy()
-        sorted_boxes = boxes.data[order]  # type: ignore
-        sorted_masks = masks.data[order]  # type: ignore
-        confs = confs[order]
-
-        img = tray_image.getImage()
-        result = img.copy()
+        result = tray_image.getImage().copy()
+        height, width = result.shape[:2]
         alpha = self.mask_alpha.getValue()
-        num_instances = masks.shape[0]
+        num_instances = len(instances.labels)
         brightness = self.color_brightness.getValue()
         hsv = [(i / num_instances, 1, brightness) for i in range(num_instances)]
         colors = list(map(lambda c: colorsys.hsv_to_rgb(*c), hsv))
         random.shuffle(colors)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = self.font_scale.getValue()
+        text_thickness = self.text_thickness.getValue()
         for i in range(num_instances):
-            mask = sorted_masks[i]
+            mask = instances.masks[i]
             (r, g, b) = colors[i]
             for c in range(3):
                 result[:, :, c] = np.where(
@@ -379,18 +1373,59 @@ class Segmentation(Analysis):
                     result[:, :, c],
                 )
 
-            x1, y1, x2, y2, _, _ = sorted_boxes[i]
+            x1, y1, x2, y2, conf, _ = instances.boxes[i]
             x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
             cv2.rectangle(result, (x1, y1), (x2, y2), (r * 255, g * 255, b * 255), self.bbox_thickness.getValue())
+
+            # confidence at the top-left of the box, kept inside the image
+            conf_text = "{:.3f}".format(conf)
+            (_, conf_h), _ = cv2.getTextSize(conf_text, font, font_scale, text_thickness)
             cv2.putText(
                 result,
-                "{:2.0f}-{:.3f}".format(i, confs[i]),
-                (x1, y1),
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=self.font_scale.getValue(),
+                conf_text,
+                (max(x1, 0), max(y1, conf_h + 5)),
+                fontFace=font,
+                fontScale=font_scale,
                 color=(255, 255, 255),
-                thickness=self.text_thickness.getValue(),
+                thickness=text_thickness,
             )
+
+            # fruit number (same as the NN in "_fruit_NN.png") in the middle of the fruit; a fruit
+            # whose position on the tray is not known is drawn in red
+            label = instances.labels[i]
+            num_scale = font_scale * 2.5
+            num_thick = text_thickness * 2
+            (num_w, num_h), _ = cv2.getTextSize(label, font, num_scale, num_thick)
+            box_w = max(x2 - x1, 1)
+            if num_w > 0.85 * box_w:  # long labels are shrunk to stay inside their fruit
+                shrink = 0.85 * box_w / num_w
+                num_scale *= shrink
+                num_thick = max(1, int(round(num_thick * shrink)))
+                (num_w, num_h), _ = cv2.getTextSize(label, font, num_scale, num_thick)
+            origin = ((x1 + x2) // 2 - num_w // 2, (y1 + y2) // 2 + num_h // 2)
+            color = (0, 0, 255) if instances.placement[i] == "unplaced" else (255, 255, 255)
+            self._putOutlinedText(result, label, origin, num_scale, color, num_thick)
+
+        # detections that were discarded as false detections: gray, with no number
+        for box, _ in instances.rejected:
+            x1, y1, x2, y2 = (int(v) for v in box[:4])
+            cv2.rectangle(result, (x1, y1), (x2, y2), (128, 128, 128), max(1, self.bbox_thickness.getValue() // 2))
+            (rej_w, rej_h), _ = cv2.getTextSize("rejected", font, font_scale, text_thickness)
+            rej_origin = (
+                min(max(x1, 0) + 5, max(width - rej_w - 5, 0)),
+                min(max(y1, 0) + rej_h + 5, height - 5),
+            )
+            self._putOutlinedText(result, "rejected", rej_origin, font_scale, (200, 200, 200), text_thickness)
+
+        # research mode: say why this tray image needs attention, shrunk to fit the image width
+        banner = instances.report.get("banner", "")
+        if banner:
+            scale = font_scale
+            (text_w, _), _ = cv2.getTextSize(banner, font, scale, text_thickness)
+            if text_w > width - 40:
+                scale = max(0.3, scale * (width - 40) / text_w)
+            self._putOutlinedText(result, banner, (20, height - 20), scale, (0, 215, 255), text_thickness)
+
         image_instance: Image = RGBImage(
             pathlib.Path(tray_image.getImageName()).stem + f"_masked_image" + ".png"
         )
@@ -496,42 +1531,33 @@ class Segmentation(Analysis):
         # returns a list of individual instances
         return tray_images
 
-    def _extractImage(self, tray_image: Image) -> List[Image]:
+    def _extractImage(self, tray_image: Image, instances: Optional[FruitInstances] = None) -> List[Image]:
         """
         Extracts individual fruit instances from the given tray image using binary masks.
 
         This method performs instance segmentation on the input tray image to isolate and extract
         images of each fruit detected by the YOLO model. It utilizes the segmentation results to
         obtain bounding boxes and masks, sorts the instances, and then extracts and saves individual
-        images for each detected fruit.
+        images for each detected fruit. Each file is named after the fruit's number (or its position
+        label in research mode), which is the same number drawn on the full masked image.
 
         Args:
             tray_image (Image): The input tray image from which to extract fruit instances.
                 This object is expected to have methods `getSegmentationResults()` and `getImage()`.
+            instances (FruitInstances): The fruit to extract. Found with `_getFruitInstances` when not given.
 
         Returns:
             List[Image]: A list of `Image` objects representing the individual fruit instances.
                 If no instances of the "fruits" class are found, an empty list is returned.
         """
-        fruit_cls = SegmentationConfig.CLASSES["fruits"]
-
-        # gets bounding boxes, binary masks, and the original full-tray image array
-        [results] = tray_image.getSegmentationResults()
-        boxes = results.boxes.cpu().numpy()
-        masks = results.masks.cpu().numpy()
-        # checks for fruit class in segmentation results
-        if not fruit_cls in boxes.cls:
+        # gets the filtered, numbered fruit detections and the original full-tray image array.
+        # The same fruit and numbers are drawn on the full masked image.
+        if instances is None:
+            instances = self._getFruitInstances(tray_image)
+        if instances is None:
             return []
-        fruit_idx = np.where(boxes.cls == fruit_cls)  # type: ignore
-        boxes = boxes[fruit_idx]
-        masks = masks[fruit_idx]
+        sorted_boxes, sorted_masks = instances.boxes, instances.masks
         tray_image_array: NDArray[np.uint8] = tray_image.getImage()
-
-        # sorts boxes and masks based on xy-coordinates
-        sorted_df = self._sortInstances(boxes.data, boxes.orig_shape)
-        order: NDArray[np.float32] = sorted_df["nums"].to_numpy()
-        sorted_boxes = boxes.data[order]  # type: ignore
-        sorted_masks = masks.data[order]  # type: ignore
 
         # extracts instances based on bounding boxes and masks
         individual_images: List[Image] = []
@@ -542,7 +1568,7 @@ class Segmentation(Analysis):
             mask = sorted_masks[i]
             for channel in range(3):
                 individual_image[:, :, channel] = tray_image_array[y1:y2, x1:x2, channel] * mask[y1:y2, x1:x2]  # type: ignore
-            image_name = pathlib.Path(tray_image.getImageName()).stem + f"_fruit_{i+1:02d}" + ".png"
+            image_name = pathlib.Path(tray_image.getImageName()).stem + f"_fruit_{instances.labels[i]}" + ".png"
             image_instance: Image = RGBImage(image_name)
             image_instance.setImage(individual_image)
             individual_images.append(image_instance)
@@ -567,6 +1593,13 @@ class Segmentation(Analysis):
         Returns:
             ist[Image]: All segmented fruit image instances.
         """
+        # checks the options (and reads the tray layout in research mode) before doing any work
+        self._checkOptions()
+        self._manifest_rows = []
+        self._report_rows = []
+        self._orientation_info = {}
+        self._reference_samples = []
+
         self.model_name: str = self.in_params.get(self.model.getName()).getValue()  # type:ignore
 
         # download trained ML models from https://osf.io to the current directory
@@ -605,10 +1638,9 @@ class Segmentation(Analysis):
             # loads image from file system with RGBImageFile(ImageIO)
             image_instance.loadImage(image_io=self.image_io)
 
-            # rotates the image to landscape if the orientation is portrait
-            h, w, _ = image_instance.getShape()
-            if h > w:
-                image_instance.rotateImage()
+            # turns the image as requested (by default, portrait images are rotated to landscape)
+            turned = self._orientImage(image_instance)
+            orientation_note, certain = "", True
 
             # predicts fruit instances in the image
             result = self._segmentInstances(image=image_instance.getImage())
@@ -616,13 +1648,36 @@ class Segmentation(Analysis):
             # sets segmentation result
             image_instance.setSegmentationResults(results=result)
 
+            # research mode with orientation 'auto': pick the turn that fits the tray layout, and
+            # find the fruit again only if the image has to be turned
+            if self.layout_rows is not None and self.orientation.getValue() == "auto":
+                extra, orientation_note, certain = self._chooseRotation(image_instance)
+                if extra:
+                    code = {
+                        90: cv2.ROTATE_90_CLOCKWISE,
+                        180: cv2.ROTATE_180,
+                        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+                    }[extra]
+                    image_instance.setImage(cv2.rotate(image_instance.getImage(), code))
+                    result = self._segmentInstances(image=image_instance.getImage())
+                    image_instance.setSegmentationResults(results=result)
+                    turned = (turned + extra) % 360
+            self._orientation_info[image_instance.getImageName()] = (turned, orientation_note, certain)
+
             try:
+                # finds, filters and numbers the fruit once, for the fruit images and the masked image
+                instances = self._getFruitInstances(image_instance)
+                if instances is None:
+                    print(f"{image_instance.getImageName()}: no fruit found")
+                    self._recordResults(image_instance, None)
+                    continue
+
                 # extracts individual instances
-                image_instances = self._extractImage(image_instance)
+                image_instances = self._extractImage(image_instance, instances)
                 # and tray information
                 tray_infos = self._extractTrayInfo(image_instance)
                 # and masked image
-                masked_image = self._extractMaskedImage(image_instance)
+                masked_image = self._extractMaskedImage(image_instance, instances)
 
                 # 1. sets the output ImageListValue with the list of segmented images
                 # 2. writes the segmented images to "segmented_images" folder
@@ -636,10 +1691,131 @@ class Segmentation(Analysis):
 
                 self.masked_images.setImageList([masked_image])
                 self.masked_images.writeValue()
-            except:
-                AttributeError("Error with the results.")
 
+                self._recordResults(image_instance, instances)
+            except Exception as err:
+                print(f"{image_instance.getImageName()}: results could not be written ({type(err).__name__}: {err})")
+
+        self._writeReports()
         return segmented_images
+
+    def _recordResults(self, tray_image: Image, instances: Optional[FruitInstances]) -> None:
+        """
+        Remembers what was found on one tray image, for the csv files written at the end.
+
+        In research mode, a tray image that needs attention is also announced in the console.
+        """
+        name = tray_image.getImageName()
+        stem = pathlib.Path(name).stem
+        if instances is not None:
+            for i, label in enumerate(instances.labels):
+                x1, y1, x2, y2, conf, _ = instances.boxes[i]
+                self._manifest_rows.append(
+                    {
+                        "image": name,
+                        "file": f"{stem}_fruit_{label}.png",
+                        "label": label,
+                        "placement": instances.placement[i],
+                        "x_center": int((x1 + x2) / 2),
+                        "y_center": int((y1 + y2) / 2),
+                        "width": int(x2 - x1),
+                        "height": int(y2 - y1),
+                        "confidence": round(float(conf), 3),
+                    }
+                )
+
+        if self.layout_rows is None:
+            return
+        report = instances.report if instances is not None else {}
+        if instances is None:
+            report = {
+                "detected": 0,
+                "expected": int(self.nexpect.getValue()),
+                "status": "check",
+                "missing": [],
+                "unplaced": 0,
+                "notes": "no fruit found",
+            }
+        turned, orientation_note, _ = self._orientation_info.get(name, (0, "", True))
+        notes = "; ".join(n for n in (report["notes"], orientation_note) if n)
+        self._report_rows.append(
+            {
+                "image": name,
+                "detected": report["detected"],
+                "expected": report["expected"],
+                "status": report["status"],
+                "empty_positions": " ".join(report["missing"]),
+                "unplaced_fruit": report["unplaced"],
+                "turned_degrees_clockwise": turned,
+                "notes": notes,
+            }
+        )
+        if report["status"] != "ok":
+            print(f"NOTICE {name}: {report['notes']}")
+
+        # a tray whose fruit were all placed without doubt (and the right way up) can teach the reference
+        if (
+            instances is not None
+            and report["status"] in ("ok", "fewer")
+            and report["unplaced"] == 0
+            and "reference" not in instances.placement
+            and self._orientation_info.get(name, (0, "", True))[2]
+        ):
+            image_height, image_width = tray_image.getShape()[:2]
+            self._reference_samples.append(
+                {
+                    label: ((box[0] + box[2]) / 2 / image_width, (box[1] + box[3]) / 2 / image_height)
+                    for label, box in zip(instances.labels, instances.boxes)
+                }
+            )
+
+    def _writeReports(self) -> None:
+        """
+        Writes fruit_manifest.csv (every fruit file with its label and position on the image) and, in
+        research mode, numbering_report.csv (one line per tray image with the count check), next to
+        the segmented_images folder.
+        """
+        out_dir = os.path.dirname(self.seg_images.getValue())
+        if self._manifest_rows:
+            os.makedirs(out_dir, exist_ok=True)
+            pd.DataFrame(self._manifest_rows).to_csv(os.path.join(out_dir, "fruit_manifest.csv"), index=False)
+        if self.layout_rows is not None and self._report_rows:
+            os.makedirs(out_dir, exist_ok=True)
+            pd.DataFrame(self._report_rows).to_csv(os.path.join(out_dir, "numbering_report.csv"), index=False)
+            flagged = [row["image"] for row in self._report_rows if row["status"] != "ok"]
+            combined = buildTrayReference(self._reference_samples)
+            if combined:
+                reference_path = os.path.join(out_dir, "tray_reference.csv")
+                pd.DataFrame(
+                    [
+                        {"label": label, "x": round(combined[label][0], 5), "y": round(combined[label][1], 5), "n_images": combined[label][2]}
+                        for row in (self.layout_rows or [])
+                        for label in row
+                        if label in combined
+                    ]
+                ).to_csv(reference_path, index=False)
+                print(
+                    f"\nTray reference saved to {reference_path} ({len(combined)} of "
+                    f"{int(self.nexpect.getValue())} positions, from {len(self._reference_samples)} tray images). "
+                    "It is best made from photos of full trays; use it with --tray_reference."
+                )
+            if self.orientation.getValue() == "auto":
+                turned = [n for n, (deg, _, _) in self._orientation_info.items() if deg]
+                unsure = [n for n, (_, _, certain) in self._orientation_info.items() if not certain]
+                print(
+                    f"\nOrientation: {len(turned)} of {len(self._orientation_info)} images were turned to fit "
+                    "the tray layout (column turned_degrees_clockwise in numbering_report.csv)."
+                )
+                if unsure:
+                    print(f"  {len(unsure)} image(s) could not be oriented with certainty (see notes in the report).")
+            print(
+                f"\nResearch check: {len(self._report_rows) - len(flagged)} of {len(self._report_rows)} tray "
+                f"images have all {int(self.nexpect.getValue())} fruit placed."
+            )
+            if flagged:
+                print("Needs attention (see numbering_report.csv and the red/yellow text on the masked images):")
+                for name in flagged:
+                    print(f"  {name}")
 
     def _preRun(self):
         """
