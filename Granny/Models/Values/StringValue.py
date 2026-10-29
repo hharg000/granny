@@ -18,6 +18,9 @@ class StringValue(Value):
             help (str): Help description or usage instructions for the parameter.
         """
         super().__init__(name, label, help)
+        # The command-line interface builds each argument's type from this attribute.
+        # Without it the type stays "Any" and any value given on the command line is rejected.
+        self.type = str
         self.valid_values: List[str] = []
 
     def setValue(self, value: str):
